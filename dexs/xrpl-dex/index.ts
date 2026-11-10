@@ -14,6 +14,26 @@ const fetch = async (options: FetchOptions) => {
     const query = `
     WITH volume AS (
         SELECT dex_xrp_pair_volume_xrp, amm_xrp_volume_xrp FROM xrpl.aggregated_metrics_daily WHERE date = DATE '${formattedDate}'
+    ), offer_swaps AS (
+        -- AMM swaps filled by an OfferCreate (an offer that crosses a pool). They leave no Offer node, only a Balance
+        -- change on the pool's AccountRoot (the one that carries AMMID), and the two volume columns above miss them:
+        -- 3,012,422.73 of the 32,716,737.04 XRP traded against XRP on 2026-10-19..25 (9.2%).
+        -- Drop this term if amm_xrp_volume_xrp starts to include them.
+        SELECT
+            COUNT(*) AS pool_changes,
+            SUM(ABS(
+                CAST(json_extract_scalar(n, '$.ModifiedNode.FinalFields.Balance.value') AS DECIMAL(38, 0))
+                - CAST(json_extract_scalar(n, '$.ModifiedNode.PreviousFields.Balance.value') AS DECIMAL(38, 0))
+            )) / 1e6 AS volume_xrp
+        FROM xrpl.transactions t
+        CROSS JOIN UNNEST(CAST(json_extract(t.metadata, '$.AffectedNodes') AS ARRAY(JSON))) AS u(n)
+        WHERE t.ledger_close_date = DATE '${formattedDate}'
+            AND t.transaction_type = 'OfferCreate'
+            AND t.result = 'tesSUCCESS'
+            AND strpos(t.metadata, 'AMMID') > 0
+            AND json_extract_scalar(n, '$.ModifiedNode.LedgerEntryType') = 'AccountRoot'
+            AND json_extract_scalar(n, '$.ModifiedNode.FinalFields.AMMID') IS NOT NULL
+            AND json_extract_scalar(n, '$.ModifiedNode.PreviousFields.Balance.value') IS NOT NULL
     ), swaps AS (
         SELECT
             ABS(ABS(amm_base_token_balance_delta) - counter_token_amount) < ABS(ABS(amm_base_token_balance_delta) - base_token_amount) AS flip,
@@ -44,10 +64,13 @@ const fetch = async (options: FetchOptions) => {
     SELECT
         volume.dex_xrp_pair_volume_xrp,
         volume.amm_xrp_volume_xrp,
+        offer_swaps.pool_changes AS amm_offer_pool_changes,
+        offer_swaps.volume_xrp AS amm_offer_volume_xrp,
         f.swaps,
         f.fees_xrp,
         f.fees_rlusd
     FROM volume
+    CROSS JOIN offer_swaps
     CROSS JOIN (
         SELECT
             COUNT(*) AS swaps,
@@ -75,8 +98,14 @@ const fetch = async (options: FetchOptions) => {
     const dexVolumeXrp = row.dex_xrp_pair_volume_xrp;
     const ammVolumeXrp = row.amm_xrp_volume_xrp;
 
+    // offers fill against AMM pools every day (11,794 to 22,544 pool changes a day on 2026-10-19..25): none means
+    // xrpl.transactions does not have the day yet
+    if (!(Number(row.amm_offer_pool_changes) > 0)) {
+        throw new Error(`no AMM swaps filled by offers in xrpl.transactions for ${formattedDate} yet`);
+    }
+
     const dailyVolume = options.createBalances();
-    dailyVolume.addCGToken("ripple", Number(ammVolumeXrp) + Number(dexVolumeXrp));
+    dailyVolume.addCGToken("ripple", Number(ammVolumeXrp) + Number(dexVolumeXrp) + Number(row.amm_offer_volume_xrp ?? 0));
 
     const dailyFees = options.createBalances();
     const dailySupplySideRevenue = options.createBalances();
@@ -96,7 +125,7 @@ const adapter: SimpleAdapter = {
     start: '2024-03-23', // first full day of the XRPL AMM (XLS-30 went live 2024-03-22)
     isExpensiveAdapter: true,
     methodology: {
-        Volume: "XRP-paired trading volume on the XRP Ledger's native DEX: AMM pool swaps plus order book trades, from Dune's xrpl.aggregated_metrics_daily.",
+        Volume: "XRP-paired trading volume on the XRP Ledger's native DEX: AMM pool swaps plus order book trades, from Dune's xrpl.aggregated_metrics_daily, plus AMM swaps filled by offers, read from the pool balance changes in xrpl.transactions.",
         Fees: "Trading fees paid on XRP Ledger AMM swaps, worked out per swap from the pool's balances before and after the trade. Covers pools with an XRP or RLUSD side; order book trades pay no trading fee. Excludes the smaller fees on single-sided deposits and withdrawals and auction-slot bids.",
         Revenue: "The XRP Ledger takes no cut of AMM trading fees.",
         SupplySideRevenue: "All AMM trading fees stay in the pools and go to their liquidity providers.",
